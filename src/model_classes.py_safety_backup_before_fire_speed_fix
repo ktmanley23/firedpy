@@ -27,6 +27,7 @@ from scipy.spatial import cKDTree
 import pandas as pd
 import rasterio
 
+from src.firespeed import computefirespeed
 from src.enums import LandCoverType, EcoRegionType
 from src.data_classes import Base
 
@@ -968,4 +969,140 @@ class ModelBuilder(Base):
         sgdf['kg_desc'] = sgdf['kg_mode'].map(KG_LEGEND)
 
         return sgdf
-    
+    def add_fire_speed_attributes(self, gdf):
+        """
+        Calculate fire spread speed using FireDPy's actual column structure.
+
+        Uses:
+        - id: Event ID to group fire events
+        - date: Daily date for temporal ordering  
+        - event_day: Day within each fire event
+        """
+
+        print("🔥 Calculating fire spread speed and maximum travel vectors...")
+
+        try:
+            print(f"   📊 Processing {len(gdf)} daily detections from {gdf['id'].nunique()} fire events")
+
+            # Initialize fire speed columns
+            gdf["max_vec_origin_x"] = np.nan
+            gdf["max_vec_origin_y"] = np.nan
+            gdf["max_vec_dest_x"] = np.nan
+            gdf["max_vec_dest_y"] = np.nan
+            gdf["fire_distance_m"] = np.nan
+            gdf["fire_speed_m_per_h"] = np.nan
+
+            # Process each fire event separately
+            events_processed = 0
+            speeds_calculated = 0
+
+            for event_id in gdf['id'].unique():
+                event_data = gdf[gdf['id'] == event_id].copy()
+                event_duration = event_data['event_dur'].iloc[0]
+
+                # Only process multi-day events
+                if event_duration < 2:
+                    continue
+
+                # Sort by date to get temporal progression
+                event_data = event_data.sort_values('date')
+                unique_dates = event_data['date'].unique()
+
+                if len(unique_dates) < 2:
+                    continue
+
+                print(f"   🔥 Event {event_id}: {len(unique_dates)} days, duration {event_duration} days")
+
+                # Create daily perimeters using convex hulls
+                daily_perimeters = []
+
+                for date in unique_dates:
+                    day_points = event_data[event_data['date'] == date]
+
+                    if len(day_points) >= 3:  # Need at least 3 points for convex hull
+                        from shapely.geometry import MultiPoint
+                        points = [geom for geom in day_points.geometry if geom is not None]
+
+                        if len(points) >= 3:
+                            try:
+                                hull = MultiPoint(points).convex_hull
+                                daily_perimeters.append({
+                                    'date': date,
+                                    'geometry': hull,
+                                    'event_day': day_points['event_day'].iloc[0]
+                                })
+                            except Exception as e:
+                                print(f"     ⚠️  Failed to create hull for {date}: {e}")
+                                continue
+
+                if len(daily_perimeters) < 2:
+                    print(f"     ⚠️  Only {len(daily_perimeters)} valid perimeters")
+                    continue
+
+                # Create GeoDataFrame of daily perimeters
+                import geopandas as gpd
+                perim_gdf = gpd.GeoDataFrame(daily_perimeters, crs=gdf.crs)
+                perim_gdf = perim_gdf.sort_values('date')
+
+                try:
+                    # Calculate fire speed for this event
+                    fs_orig_x, fs_orig_y, fs_dest_x, fs_dest_y, fs_max_dist, fs_speed = computefirespeed(perim_gdf)
+
+                    # Apply results to all detections in this event
+                    if len(fs_speed) > 1 and any(not np.isnan(s) for s in fs_speed):
+                        # Calculate summary statistics for this event
+                        valid_speeds = [s for s in fs_speed if not np.isnan(s)]
+                        valid_distances = [d for d in fs_max_dist if not np.isnan(d)]
+
+                        if valid_speeds:
+                            max_speed = max(valid_speeds)
+                            avg_speed = np.mean(valid_speeds)
+                            max_distance = max(valid_distances) if valid_distances else np.nan
+
+                            # Get the maximum spread vector (for the day with highest speed)
+                            max_speed_idx = fs_speed.index(max_speed) if max_speed in fs_speed else -1
+
+                            # Apply to all detections in this event
+                            event_mask = gdf['id'] == event_id
+                            gdf.loc[event_mask, "max_vec_origin_x"] = fs_orig_x[max_speed_idx] if max_speed_idx >= 0 and max_speed_idx < len(fs_orig_x) else np.nan
+                            gdf.loc[event_mask, "max_vec_origin_y"] = fs_orig_y[max_speed_idx] if max_speed_idx >= 0 and max_speed_idx < len(fs_orig_y) else np.nan
+                            gdf.loc[event_mask, "max_vec_dest_x"] = fs_dest_x[max_speed_idx] if max_speed_idx >= 0 and max_speed_idx < len(fs_dest_x) else np.nan
+                            gdf.loc[event_mask, "max_vec_dest_y"] = fs_dest_y[max_speed_idx] if max_speed_idx >= 0 and max_speed_idx < len(fs_dest_y) else np.nan
+                            gdf.loc[event_mask, "fire_distance_m"] = max_distance
+                            gdf.loc[event_mask, "fire_speed_m_per_h"] = max_speed
+
+                            print(f"     ✅ Max speed: {max_speed:.0f} m/h ({max_speed/1000:.1f} km/h), Max distance: {max_distance:.0f} m")
+                            speeds_calculated += 1
+
+                except Exception as e:
+                    print(f"     ❌ Speed calculation failed: {e}")
+                    continue
+
+                events_processed += 1
+
+            print(f"   ✅ Processed {events_processed} multi-day events")
+            print(f"   🏃 Calculated speeds for {speeds_calculated} events")
+
+            # Summary statistics
+            valid_speeds = gdf[gdf['fire_speed_m_per_h'].notna()]['fire_speed_m_per_h']
+            if len(valid_speeds) > 0:
+                print(f"   📊 Speed range: {valid_speeds.min():.0f} - {valid_speeds.max():.0f} m/h")
+                print(f"   📊 Average speed: {valid_speeds.mean():.0f} m/h ({valid_speeds.mean()/1000:.1f} km/h)")
+
+            return gdf
+
+        except Exception as e:
+            print(f"   ❌ Fire speed calculation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Ensure columns exist even if calculation fails
+            if "max_vec_origin_x" not in gdf.columns:
+                gdf["max_vec_origin_x"] = np.nan
+                gdf["max_vec_origin_y"] = np.nan
+                gdf["max_vec_dest_x"] = np.nan
+                gdf["max_vec_dest_y"] = np.nan
+                gdf["fire_distance_m"] = np.nan
+                gdf["fire_speed_m_per_h"] = np.nan
+
+            return gdf
