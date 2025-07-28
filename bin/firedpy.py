@@ -229,6 +229,9 @@ def main():
     gdf = models.process_geometry(gdf)
 
     gdf = models.add_eco_region_attributes(gdf, eco_region_type, eco_region_level)
+    
+    # Calculate fire spread speed and maximum travel vectors
+    gdf = models.add_fire_speed_attributes(gdf)
     # Calculate fire spread speed and maximum travel vectors
 
     gdf = models.add_kg_attributes(gdf)
